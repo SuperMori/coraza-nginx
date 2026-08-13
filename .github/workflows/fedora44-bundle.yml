@@ -1,0 +1,127 @@
+name: Fedora 44 bundle
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/fedora44-bundle.yml
+      - .github/scripts/fetch-verify.sh
+      - packaging/fedora44/**
+      - config
+      - src/**
+  push:
+    branches: [main]
+    tags: [bundle-v*]
+    paths:
+      - .github/workflows/fedora44-bundle.yml
+      - .github/scripts/fetch-verify.sh
+      - packaging/fedora44/**
+      - config
+      - src/**
+  workflow_dispatch: {}
+
+permissions: {}
+
+concurrency:
+  group: fedora44-bundle-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build and smoke-test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    outputs:
+      artifact-name: ${{ steps.metadata.outputs.artifact-name }}
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Build, test, and package
+        run: packaging/fedora44/run-ci.sh
+
+      - name: Read artifact metadata
+        id: metadata
+        run: echo "artifact-name=$(cat dist/fedora44/artifact-name.txt)" >> "$GITHUB_OUTPUT"
+
+      - name: Generate SPDX SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          path: dist/fedora44/root/opt/coraza-nginx/current
+          format: spdx-json
+          output-file: dist/fedora44/coraza-nginx-fedora44-x86_64.spdx.json
+          syft-version: v1.51.0
+          dependency-snapshot: false
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Upload review artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fedora44-bundle
+          path: |
+            dist/fedora44/*.tar.gz
+            dist/fedora44/*.tar.gz.sha256
+            dist/fedora44/*.manifest.json
+            dist/fedora44/*.spdx.json
+            dist/fedora44/artifact-name.txt
+          if-no-files-found: error
+          retention-days: 14
+
+  attest:
+    name: Attest reviewed artifact
+    needs: build
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/bundle-v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download reviewed artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: fedora44-bundle
+          path: dist/fedora44
+
+      - name: Generate build provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: dist/fedora44/*.tar.gz
+
+      - name: Generate SBOM attestation
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: dist/fedora44/*.tar.gz
+          sbom-path: dist/fedora44/coraza-nginx-fedora44-x86_64.spdx.json
+
+  release:
+    name: Publish tagged bundle
+    needs: [build, attest]
+    if: startsWith(github.ref, 'refs/tags/bundle-v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download attested artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: fedora44-bundle
+          path: dist/fedora44
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            dist/fedora44/*.tar.gz \
+            dist/fedora44/*.tar.gz.sha256 \
+            dist/fedora44/*.manifest.json \
+            dist/fedora44/*.spdx.json
