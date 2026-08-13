@@ -15,3 +15,7 @@ fuzz/fuzz-*.log
 compile_commands.json
 _lint/
 corpus_pack_headers-min/
+
+# locally generated Fedora bundle artifacts
+/dist/
+__pycache__/
