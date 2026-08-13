@@ -1,0 +1,153 @@
+name: Production CRS LTS candidate
+
+# Check the currently deployed CRS LTS line every day. Patch releases become a
+# reviewed candidate branch after the exact Fedora bundle passes its smoke test.
+# A new LTS line only creates a review issue; it is never promoted automatically.
+on:
+  schedule:
+    # 03:17 Asia/Shanghai (19:17 UTC), away from the top-of-hour Actions peak.
+    - cron: "17 19 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production-crs-lts-candidate
+  cancel-in-progress: false
+
+jobs:
+  candidate:
+    name: Resolve, test, and publish candidate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install tools
+        run: sudo apt-get update && sudo apt-get install -y jq curl
+
+      - name: Resolve production CRS candidate
+        id: resolve
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          bash .github/scripts/compute-production-crs-candidate.sh /tmp/crs-candidate.env \
+            | tee /tmp/crs-candidate-summary.txt
+          cat /tmp/crs-candidate.env >> "$GITHUB_OUTPUT"
+
+      - name: Report a newer LTS line for manual review
+        if: steps.resolve.outputs.newer_lts_line == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CURRENT_VERSION: ${{ steps.resolve.outputs.current_version }}
+          LATEST_LTS_VERSION: ${{ steps.resolve.outputs.latest_lts_version }}
+        run: |
+          title="[CRS] Review new LTS line v${LATEST_LTS_VERSION}"
+          cat > /tmp/new-lts-line.md <<EOF
+          OWASP CRS published a newer LTS line.
+
+          - Current production line: \`v${CURRENT_VERSION}\`
+          - New LTS release: \`v${LATEST_LTS_VERSION}\`
+          - Detection run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
+
+          This automation intentionally did not change production pins. A new
+          LTS line needs an explicit compatibility review, false-positive test,
+          and a separately approved candidate release.
+          EOF
+          bash .github/scripts/upsert-automation-issue.sh "$title" /tmp/new-lts-line.md
+
+      - name: Build and smoke-test exact Fedora candidate
+        if: steps.resolve.outputs.changed == 'true'
+        run: packaging/fedora44/run-ci.sh
+
+      - name: Add candidate metadata to build evidence
+        if: steps.resolve.outputs.changed == 'true'
+        run: |
+          cp /tmp/crs-candidate.env dist/fedora44/crs-candidate.env
+          cp /tmp/crs-candidate-summary.txt dist/fedora44/crs-candidate-summary.txt
+
+      - name: Upload candidate evidence
+        if: steps.resolve.outputs.changed == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: crs-lts-candidate-${{ steps.resolve.outputs.candidate_version }}
+          path: |
+            dist/fedora44/*.tar.gz
+            dist/fedora44/*.tar.gz.sha256
+            dist/fedora44/*.manifest.json
+            dist/fedora44/artifact-name.txt
+            dist/fedora44/crs-candidate.env
+            dist/fedora44/crs-candidate-summary.txt
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish reviewed candidate branch
+        if: steps.resolve.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CURRENT_VERSION: ${{ steps.resolve.outputs.current_version }}
+          CANDIDATE_VERSION: ${{ steps.resolve.outputs.candidate_version }}
+          CANDIDATE_SHA256: ${{ steps.resolve.outputs.candidate_sha256 }}
+        run: |
+          set -euo pipefail
+          branch="automation/crs-lts-${CANDIDATE_VERSION}"
+          title="Build CRS v${CANDIDATE_VERSION} production candidate"
+          compare_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/compare/main...${branch}?expand=1"
+
+          gh auth setup-git
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$branch"
+          git add packaging/fedora44/versions.env
+          git commit -m "Build CRS v${CANDIDATE_VERSION} production candidate"
+
+          git fetch origin "$branch:refs/remotes/origin/$branch" || true
+          git push --force-with-lease origin "HEAD:refs/heads/$branch"
+
+          cat > /tmp/candidate-pr.md <<EOF
+          Updates the Fedora 44 production bundle from OWASP CRS
+          \`v${CURRENT_VERSION}\` to the same-LTS-line patch release
+          \`v${CANDIDATE_VERSION}\`.
+
+          - Source archive SHA256: \`${CANDIDATE_SHA256}\`
+          - Exact Fedora bundle build and smoke test: passed
+          - Workflow evidence: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
+          - Automatic release or deployment: disabled
+
+          After PR checks pass, this still requires human review, a tagged
+          candidate bundle, shadow-lane observation, and an explicit production
+          deployment decision.
+          EOF
+
+          if gh pr view "$branch" --json number >/dev/null 2>&1; then
+            if gh pr edit "$branch" --body-file /tmp/candidate-pr.md; then
+              exit 0
+            fi
+          elif gh pr create --base main --head "$branch" --title "$title" \
+            --body-file /tmp/candidate-pr.md; then
+            exit 0
+          fi
+
+          # SuperMori currently disallows GITHUB_TOKEN-created PRs at the
+          # organization level. Preserve automation by publishing the tested
+          # branch and an actionable issue instead of silently dropping it.
+          cat >> /tmp/candidate-pr.md <<EOF
+
+          The organization policy prevented GitHub Actions from opening the PR.
+          Open the prepared comparison manually: ${compare_url}
+          EOF
+          bash .github/scripts/upsert-automation-issue.sh \
+            "[CRS Candidate] v${CANDIDATE_VERSION} is ready" \
+            /tmp/candidate-pr.md
+
+      - name: Confirm no production change is required
+        if: steps.resolve.outputs.changed != 'true'
+        run: echo "Current production CRS LTS patch is already up to date."

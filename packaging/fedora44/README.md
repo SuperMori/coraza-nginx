@@ -32,6 +32,20 @@ RPM set. Fedora package repositories are update streams, so the build manifest
 records every builder package; this is traceable but should not be described as
 bit-for-bit reproducible across arbitrary future dates.
 
+## CRS update policy
+
+`crs-production-candidate.yml` checks the current production LTS line daily.
+It never follows the mutable CRS `main` branch and never updates Fedora hosts in
+place. A same-line patch release is downloaded from its immutable release tag,
+recorded with a fresh SHA256, built, and smoke-tested before an automation branch
+is published. A new LTS line creates a review issue only because it can change
+rule behavior and false-positive characteristics.
+
+The production pin in `versions.env` changes only through review. If the
+organization permits GitHub Actions to create pull requests, the workflow opens
+one; otherwise it creates an issue linking to the tested candidate branch. A
+human must still approve a tagged bundle and the separate deployment change.
+
 ## Release trust boundary
 
 Pull requests receive read-only GitHub permissions and upload only temporary
